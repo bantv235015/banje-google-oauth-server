@@ -1,0 +1,16 @@
+{
+  "name": "google-oauth-server",
+  "version": "1.0.0",
+  "description": "OAuth2 server migrated from Google Apps Script",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "googleapis": "^137.1.0"
+  }
+}
