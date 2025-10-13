@@ -25,7 +25,7 @@ WORKDIR /usr/src/app
 
 # Sao chép các dependency đã được cài đặt từ giai đoạn build
 COPY --from=build /usr/src/app/node_modules ./node_modules
-
+ 
 # Sao chép mã nguồn ứng dụng từ giai đoạn build
 COPY --from=build /usr/src/app ./
 

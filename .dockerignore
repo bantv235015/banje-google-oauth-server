@@ -7,7 +7,6 @@ logs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-
 # Thư mục chứa các dependency đã cài đặt (sẽ được cài lại bên trong container)
 node_modules
 
