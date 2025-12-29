@@ -1,12 +1,16 @@
 // Import các thư viện cần thiết
 const express = require("express");
 const axios = require("axios");
-const crypto = require("crypto");
+const crypto = require("node:crypto");
 const { google } = require("googleapis");
 require("dotenv").config(); // Tải các biến môi trường từ file .env
 
 // Lấy thông tin credentials từ biến môi trường
 const {
+  FB_APP_ID,
+  FB_APP_SECRET,
+  FB_REDIRECT_URI,
+  FB_API_VERSION,
   GOOGLE_CLIENT_ID,
   GOOGLE_CLIENT_SECRET,
   REDIRECT_URI,
@@ -479,6 +483,220 @@ async function writeEtsyTokenToSheet(
       "[SHEETS ERROR] Không thể ghi vào Google Sheet:",
       error.message
     );
+    throw new Error("Lỗi ghi Sheet: " + error.message);
+  }
+}
+
+// Cache lưu trạng thái phiên (State -> {sheetId, timestamp})
+const fbSessionCache = new Map();
+
+// Các quyền (Scope) cần thiết
+const FB_SCOPES = [
+  "public_profile",
+  "business_management",
+  "ads_management",
+  "ads_read",
+  "pages_read_engagement",
+  "pages_show_list",
+  "read_insights",
+].join(",");
+
+// ===============================================================
+// ROUTE 1: Bắt đầu đăng nhập Facebook (/facebook/auth)
+// ===============================================================
+app.get("/facebook/auth", (req, res) => {
+  const { sheetId } = req.query;
+
+  if (!sheetId) {
+    return res.status(400).send("Thiếu tham số: sheetId");
+  }
+
+  // 1. Tạo State ngẫu nhiên để bảo mật và lưu sheetId
+  const state = crypto.randomBytes(16).toString("hex");
+  fbSessionCache.set(state, { sheetId, timestamp: Date.now() });
+
+  // 2. Tạo URL đăng nhập Facebook
+  const loginUrl = `https://www.facebook.com/${FB_API_VERSION}/dialog/oauth?client_id=${FB_APP_ID}&redirect_uri=${encodeURIComponent(
+    FB_REDIRECT_URI
+  )}&scope=${FB_SCOPES}&state=${state}&response_type=code`;
+
+  res.json({ auth_url: loginUrl });
+});
+
+// ===============================================================
+// ROUTE 2: Xử lý Callback từ Facebook (/facebook/callback)
+// ===============================================================
+app.get("/facebook/callback", async (req, res) => {
+  const { code, state, error } = req.query;
+
+  if (error) {
+    return res.status(400).send(`Facebook Error: ${error}`);
+  }
+
+  // 1. Kiểm tra State
+  const sessionData = fbSessionCache.get(state);
+  if (!sessionData) {
+    return res.status(400).send("State không hợp lệ hoặc phiên đã hết hạn.");
+  }
+  const { sheetId } = sessionData;
+  fbSessionCache.delete(state); // Xóa cache
+
+  try {
+    // 2. Đổi Code lấy Short-Lived Access Token (1-2 giờ)
+    const tokenUrl = `https://graph.facebook.com/${FB_API_VERSION}/oauth/access_token`;
+    const shortTokenRes = await axios.get(tokenUrl, {
+      params: {
+        client_id: FB_APP_ID,
+        client_secret: FB_APP_SECRET,
+        redirect_uri: FB_REDIRECT_URI,
+        code: code,
+      },
+    });
+
+    const shortAccessToken = shortTokenRes.data.access_token;
+
+    // 3. [QUAN TRỌNG] Đổi Short-Lived Token lấy Long-Lived Token (60 ngày)
+    // Bước này giúp hệ thống của bạn chạy ổn định mà không bắt user login lại
+    const longTokenUrl = `https://graph.facebook.com/${FB_API_VERSION}/oauth/access_token`;
+    const longTokenRes = await axios.get(longTokenUrl, {
+      params: {
+        grant_type: "fb_exchange_token",
+        client_id: FB_APP_ID,
+        client_secret: FB_APP_SECRET,
+        fb_exchange_token: shortAccessToken,
+      },
+    });
+
+    const longAccessToken = longTokenRes.data.access_token;
+    const expiresInSeconds = longTokenRes.data.expires_in; // Thường là ~5184000 (60 ngày)
+
+    // 4. Lấy thông tin User (Tên + ID) để lưu
+    const userUrl = `https://graph.facebook.com/${FB_API_VERSION}/me?fields=id,name&access_token=${longAccessToken}`;
+    const userRes = await axios.get(userUrl);
+    const { id: userId, name: userName } = userRes.data;
+
+    console.log(
+      `[FACEBOOK] Đã lấy Long-Lived Token cho: ${userName} (${userId})`
+    );
+
+    // 5. Ghi vào Google Sheet
+    await writeFacebookTokenToSheet(
+      sheetId,
+      userId,
+      userName,
+      longAccessToken,
+      expiresInSeconds
+    );
+
+    res.send(`
+      <style>body{font-family:sans-serif;text-align:center;padding-top:50px}</style>
+      <h2>✅ Kết nối Facebook thành công!</h2>
+      <p>Tài khoản: <b>${userName}</b> (ID: ${userId})</p>
+      <p>Token dài hạn (60 ngày) đã được lưu vào Google Sheet.</p>
+      <script>setTimeout(()=>window.close(), 5000)</script>
+    `);
+  } catch (err) {
+    console.error("[FB ERROR]", err.response ? err.response.data : err.message);
+    res.status(500).send("Lỗi xác thực Facebook: " + err.message);
+  }
+});
+
+// ===============================================================
+// HELPER: Ghi Token vào Google Sheet
+// ===============================================================
+async function writeFacebookTokenToSheet(
+  spreadsheetId,
+  userId,
+  userName,
+  token,
+  expiresIn
+) {
+  try {
+    // Auth Service Account
+    const auth = new google.auth.JWT(
+      GOOGLE_SERVICE_ACCOUNT_EMAIL,
+      null,
+      GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+      ["https://www.googleapis.com/auth/spreadsheets"]
+    );
+    const sheets = google.sheets({ version: "v4", auth });
+    const sheetName = "Facebook_Tokens";
+
+    // Kiểm tra/Tạo Sheet
+    const ssInfo = await sheets.spreadsheets.get({ spreadsheetId });
+    let targetSheet = ssInfo.data.sheets.find(
+      (s) => s.properties.title === sheetName
+    );
+
+    if (!targetSheet) {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: {
+          requests: [{ addSheet: { properties: { title: sheetName } } }],
+        },
+      });
+      // Tạo Header
+      await sheets.spreadsheets.values.append({
+        spreadsheetId,
+        range: `${sheetName}!A1`,
+        valueInputOption: "USER_ENTERED",
+        requestBody: {
+          values: [
+            [
+              "User ID",
+              "Name",
+              "Access Token (Long-Lived)",
+              "Expires In (Seconds)",
+              "Updated At",
+            ],
+          ],
+        },
+      });
+    }
+
+    // Kiểm tra xem User ID đã tồn tại chưa để Update hay Append
+    const readRes = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `${sheetName}!A:A`,
+    });
+
+    const rows = readRes.data.values || [];
+    let rowIndex = -1;
+
+    // Tìm dòng chứa User ID (bỏ qua header)
+    for (let i = 1; i < rows.length; i++) {
+      if (rows[i][0] == userId) {
+        rowIndex = i + 1;
+        break;
+      }
+    }
+
+    const rowData = [
+      userId,
+      userName,
+      token,
+      expiresIn,
+      new Date().toISOString(),
+    ];
+
+    if (rowIndex > -1) {
+      // Update
+      await sheets.spreadsheets.values.update({
+        spreadsheetId,
+        range: `${sheetName}!A${rowIndex}:E${rowIndex}`,
+        valueInputOption: "USER_ENTERED",
+        requestBody: { values: [rowData] },
+      });
+    } else {
+      // Append
+      await sheets.spreadsheets.values.append({
+        spreadsheetId,
+        range: `${sheetName}!A1`,
+        valueInputOption: "USER_ENTERED",
+        requestBody: { values: [rowData] },
+      });
+    }
+  } catch (error) {
     throw new Error("Lỗi ghi Sheet: " + error.message);
   }
 }
